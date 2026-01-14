@@ -21,7 +21,7 @@ def get_custom_fields(list_id, api_token):
     return response.json().get("fields", [])
 
 
-def create_task(list_id, name, description, custom_fields, api_token):
+def create_task(list_id, name, description, custom_fields, api_token, status=None):
     """Create a task in a ClickUp list.
 
     Args:
@@ -30,6 +30,7 @@ def create_task(list_id, name, description, custom_fields, api_token):
         description: Task description
         custom_fields: List of dicts with 'id' and 'value' keys
         api_token: ClickUp API token
+        status: Optional native task status (e.g., "Open", "In Progress", "Deployed")
 
     Returns:
         tuple: (success: bool, message: str)
@@ -43,6 +44,9 @@ def create_task(list_id, name, description, custom_fields, api_token):
 
     if custom_fields:
         payload["custom_fields"] = custom_fields
+
+    if status:
+        payload["status"] = status
 
     response = requests.post(url, headers=get_headers(api_token), json=payload)
 
