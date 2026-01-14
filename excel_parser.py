@@ -19,6 +19,7 @@ def parse_linked_user_stories(linked_str: str) -> List[str]:
     """
     Parse the 'Linked User Stories' column which can contain:
     - Comma-separated IDs: "US-Login-1, US-Login-2, US-Login-3"
+    - Newline-separated IDs: "US-HomePage-1\nUS-HomePage-2\nUS-HomePage-3"
     - Range format: "US-VR-15 -> US-VR-17" (expands to US-VR-15, US-VR-16, US-VR-17)
     - Mixed: "US-Login-1, US-VR-15 -> US-VR-17, US-Auth-5"
 
@@ -30,8 +31,9 @@ def parse_linked_user_stories(linked_str: str) -> List[str]:
     result = []
     linked_str = str(linked_str).strip()
 
-    # Split by comma first
-    parts = [p.strip() for p in linked_str.split(",")]
+    # Normalize: replace newlines with commas, then split by comma
+    linked_str = linked_str.replace('\n', ',').replace('\r', ',')
+    parts = [p.strip() for p in linked_str.split(",") if p.strip()]
 
     for part in parts:
         if not part:
@@ -179,6 +181,12 @@ def parse_user_story_sheet(wb, sheet_name: str, epic_mapping: Dict[str, dict]) -
     ac_col = (headers.get("acceptance criteria") or
               headers.get("ac"))
 
+    # Additional mapping columns
+    revised_col = headers.get("revised?") or headers.get("revised")
+    status_col = headers.get("status")
+    environment_col = headers.get("environment")
+    source_col = headers.get("source")
+
     if not id_col or not title_col:
         raise ValueError(
             f"Sheet '{sheet_name}' missing required columns. "
@@ -224,12 +232,36 @@ def parse_user_story_sheet(wb, sheet_name: str, epic_mapping: Dict[str, dict]) -
 
         description = "".join(description_parts)
 
+        # Extract additional field values
+        revised_val = None
+        if revised_col and row[revised_col - 1].value:
+            revised_val = str(row[revised_col - 1].value).strip()
+
+        status_val = None
+        if status_col and row[status_col - 1].value:
+            status_val = str(row[status_col - 1].value).strip()
+
+        environment_val = None
+        if environment_col and row[environment_col - 1].value:
+            env_str = str(row[environment_col - 1].value).strip()
+            # Environment can be comma-separated (e.g., "Desktop, Mobile")
+            environment_val = [e.strip() for e in env_str.split(",") if e.strip()]
+
+        source_val = None
+        if source_col and row[source_col - 1].value:
+            source_val = str(row[source_col - 1].value).strip()
+
         tasks.append({
             "name": task_name,
             "description": description,
             "epic": epic_info["epic_label"] if epic_info else None,
             "epic_info": epic_info,
             "user_story_id": us_id,
+            # Auto-mapped fields from Excel
+            "revised": revised_val,
+            "status": status_val,
+            "environment": environment_val,
+            "source": source_val,
             "_source_sheet": sheet_name,
             "_source_row": row_num
         })

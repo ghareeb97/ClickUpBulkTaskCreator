@@ -71,94 +71,13 @@ with st.sidebar:
         help="The ClickUp List ID where tasks will be created"
     )
 
-    if api_token and list_id:
-        if st.button("Check Fields", type="primary"):
-            try:
-                fields = get_custom_fields(list_id, api_token)
-                st.session_state["custom_fields"] = fields
-
-                # Check required fields
-                required = config.get("required_custom_fields", [])
-                if required:
-                    field_status = check_required_fields(fields, required)
-                    st.session_state["field_status"] = field_status
-
-                # Validate Epic options against required epics from Excel
-                required_epics = st.session_state.get("required_epics", set())
-                if required_epics:
-                    # Find Epic field
-                    epic_field = next((f for f in fields if f.get("name") == "Epic" and f.get("type") == "drop_down"), None)
-                    if epic_field:
-                        existing_options = {opt.get("name") for opt in epic_field.get("type_config", {}).get("options", [])}
-                        missing_epics = required_epics - existing_options
-                        st.session_state["missing_epics"] = missing_epics
-                    else:
-                        # Epic field doesn't exist - all epics are "missing"
-                        st.session_state["missing_epics"] = required_epics
-                else:
-                    st.session_state["missing_epics"] = set()
-
-                st.success(f"Loaded {len(fields)} custom fields")
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-        # Show Setup Status
-        if "field_status" in st.session_state:
-            st.markdown("---")
-            st.subheader("Setup Status")
-
-            field_status = st.session_state["field_status"]
-            missing_epics = st.session_state.get("missing_epics", set())
-
-            fields_ready = all(f["exists"] and not f.get("missing_options") for f in field_status)
-            epics_ready = len(missing_epics) == 0
-            all_ready = fields_ready and epics_ready
-
-            if all_ready:
-                st.success("All required fields are configured!")
-                st.session_state["setup_complete"] = True
-            else:
-                st.session_state["setup_complete"] = False
-
-            for field in field_status:
-                if field["exists"] and not field.get("missing_options"):
-                    st.markdown(f"✅ **{field['name']}** - Ready")
-                elif field["exists"] and field.get("missing_options"):
-                    st.markdown(f"⚠️ **{field['name']}** - Missing options")
-                    with st.expander(f"Add missing options to {field['name']}"):
-                        st.write(f"Missing: {', '.join(field['missing_options'])}")
-                        st.write("Add these options in ClickUp, then click 'Check Fields' again.")
-                else:
-                    st.markdown(f"❌ **{field['name']}** - Not found")
-                    with st.expander(f"How to create {field['name']}"):
-                        for step in field.get("instructions", []):
-                            st.markdown(step)
-
-            # Show missing Epic options from Excel
-            if missing_epics:
-                st.markdown(f"❌ **Epic Options** - {len(missing_epics)} missing")
-                with st.expander("Create these Epic options in ClickUp"):
-                    st.write("The following Epic values from your Excel file don't exist in ClickUp:")
-                    for epic in sorted(missing_epics):
-                        st.code(epic, language=None)
-                    st.markdown("---")
-                    st.markdown("**How to add them:**")
-                    st.markdown("1. Open your ClickUp List")
-                    st.markdown("2. Find the **Epic** column")
-                    st.markdown("3. Click on any cell in that column")
-                    st.markdown("4. Click **+ Add Option**")
-                    st.markdown("5. Paste each Epic name **exactly** as shown above")
-                    st.markdown("6. Click **'Check Fields'** again to verify")
-            elif st.session_state.get("required_epics"):
-                st.markdown("✅ **Epic Options** - All values exist")
-
 # Main area
 col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.header("Task Input")
+    st.header("Step 1: Select Tasks")
 
-    input_method = st.radio("Input method", ["Upload JSON", "Paste JSON", "Upload Excel"])
+    input_method = st.radio("Input method", ["Upload JSON", "Paste JSON", "Upload Excel"], index=2)
 
     tasks = []
 
@@ -167,9 +86,15 @@ with col1:
         if uploaded_file:
             try:
                 tasks = json.load(uploaded_file)
+                if not st.session_state.get("tasks_ready"):
+                    st.session_state["tasks_ready"] = True
+                    st.rerun()
                 st.success(f"Loaded {len(tasks)} tasks")
             except json.JSONDecodeError as e:
+                st.session_state["tasks_ready"] = False
                 st.error(f"Invalid JSON: {e}")
+        else:
+            st.session_state["tasks_ready"] = False
 
     elif input_method == "Paste JSON":
         json_text = st.text_area(
@@ -180,9 +105,15 @@ with col1:
         if json_text:
             try:
                 tasks = json.loads(json_text)
+                if not st.session_state.get("tasks_ready"):
+                    st.session_state["tasks_ready"] = True
+                    st.rerun()
                 st.success(f"Parsed {len(tasks)} tasks")
             except json.JSONDecodeError as e:
+                st.session_state["tasks_ready"] = False
                 st.error(f"Invalid JSON: {e}")
+        else:
+            st.session_state["tasks_ready"] = False
 
     elif input_method == "Upload Excel":
         uploaded_file = st.file_uploader(
@@ -213,13 +144,16 @@ with col1:
                 selected_sheets = st.multiselect(
                     "User Story Sheets",
                     options=user_story_sheets,
-                    default=user_story_sheets,
+                    default=[],
                     help="Select which sheets to import as tasks"
                 )
 
                 if selected_sheets:
                     # Parse selected sheets
                     tasks, stats = parse_excel_workbook(file_bytes, selected_sheets)
+                    if not st.session_state.get("tasks_ready"):
+                        st.session_state["tasks_ready"] = True
+                        st.rerun()
 
                     # Extract unique Epic names from parsed tasks for validation
                     unique_epics = set(t.get("epic") for t in tasks if t.get("epic"))
@@ -237,13 +171,46 @@ with col1:
                         f"{stats['with_epic']} tasks linked to Epics."
                     )
 
+                    # Extract unique values for all auto-mapped fields
+                    unique_values = {
+                        "revised": set(),
+                        "status": set(),
+                        "environment": set(),
+                        "source": set()
+                    }
+                    for t in tasks:
+                        if t.get("revised"):
+                            unique_values["revised"].add(t["revised"])
+                        if t.get("status"):
+                            unique_values["status"].add(t["status"])
+                        if t.get("environment"):
+                            for env in t["environment"]:
+                                unique_values["environment"].add(env)
+                        if t.get("source"):
+                            unique_values["source"].add(t["source"])
+
+                    st.session_state["excel_unique_values"] = unique_values
+
+                    # Show what values were found
+                    with st.expander("📋 Field values found in Excel"):
+                        for field, values in unique_values.items():
+                            if values:
+                                st.write(f"**{field}**: {', '.join(sorted(values))}")
+
                     if unique_epics:
                         st.warning(f"Found {len(unique_epics)} unique Epic(s) - click **'Check Fields'** to validate they exist in ClickUp")
+                else:
+                    if st.session_state.get("tasks_ready"):
+                        st.session_state["tasks_ready"] = False
+                        st.rerun()
 
             except Exception as e:
+                st.session_state["tasks_ready"] = False
                 st.error(f"Error parsing Excel: {e}")
                 import traceback
                 st.code(traceback.format_exc())
+        else:
+            st.session_state["tasks_ready"] = False
 
     # Tasks Preview
     if tasks:
@@ -251,10 +218,21 @@ with col1:
 
         for i, task in enumerate(tasks[:10]):
             task_name = task.get('name', 'Unnamed')
-            epic = task.get('epic')
 
-            if epic:
-                st.text(f"{i+1}. {task_name} [Epic: {epic}]")
+            # Build compact field summary
+            tags = []
+            if task.get('epic'):
+                tags.append(f"Epic: {task.get('epic')}")
+            if task.get('status'):
+                tags.append(task.get('status'))
+            if task.get('environment'):
+                env = task.get('environment')
+                env_str = ", ".join(env) if isinstance(env, list) else env
+                tags.append(env_str)
+
+            if tags:
+                st.text(f"{i+1}. {task_name}")
+                st.caption(f"   {' | '.join(tags)}")
             else:
                 st.text(f"{i+1}. {task_name}")
 
@@ -265,13 +243,132 @@ with col1:
         with st.expander("View All Tasks"):
             for i, task in enumerate(tasks):
                 st.markdown(f"**{i+1}. {task.get('name', 'Unnamed')}**")
+
+                # Show auto-mapped field values
+                field_tags = []
                 if task.get('epic'):
-                    st.caption(f"Epic: {task.get('epic')}")
+                    field_tags.append(f"🏷️ Epic: {task.get('epic')}")
+                if task.get('revised'):
+                    field_tags.append(f"✅ Revised: {task.get('revised')}")
+                if task.get('status'):
+                    field_tags.append(f"📊 Status: {task.get('status')}")
+                if task.get('environment'):
+                    env_str = ", ".join(task.get('environment')) if isinstance(task.get('environment'), list) else task.get('environment')
+                    field_tags.append(f"💻 Environment: {env_str}")
+                if task.get('source'):
+                    field_tags.append(f"📁 Source: {task.get('source')}")
+
+                if field_tags:
+                    st.caption(" | ".join(field_tags))
+
                 desc = task.get('description', '')
                 if desc:
                     preview = desc[:200] + "..." if len(desc) > 200 else desc
                     st.text(preview)
                 st.divider()
+
+        # Step 2: Validate ClickUp Fields
+        st.markdown("---")
+        st.subheader("Step 2: Validate ClickUp Fields")
+
+        if not api_token or not list_id:
+            st.warning("Enter API Token and List ID in the sidebar first")
+        else:
+            if st.button("Check Fields", type="primary"):
+                try:
+                    # Clear previous validation state
+                    st.session_state["missing_field_values"] = {}
+                    st.session_state["auto_map_fields"] = {}
+
+                    fields = get_custom_fields(list_id, api_token)
+                    st.session_state["custom_fields"] = fields
+
+                    # Check required fields
+                    required = config.get("required_custom_fields", [])
+                    if required:
+                        field_status = check_required_fields(fields, required)
+                        st.session_state["field_status"] = field_status
+
+                    # Validate Epic options against required epics from Excel
+                    required_epics = st.session_state.get("required_epics", set())
+                    if required_epics:
+                        epic_field = next((f for f in fields if f.get("name") == "Epic" and f.get("type") == "drop_down"), None)
+                        if epic_field:
+                            existing_options = {opt.get("name") for opt in epic_field.get("type_config", {}).get("options", [])}
+                            missing_epics = required_epics - existing_options
+                            st.session_state["missing_epics"] = missing_epics
+                        else:
+                            st.session_state["missing_epics"] = required_epics
+                    else:
+                        st.session_state["missing_epics"] = set()
+
+                    st.success(f"Loaded {len(fields)} custom fields")
+
+                    # Check which Excel fields don't have matching ClickUp fields
+                    excel_fields_needing_match = {"Revised?", "Status", "Environment", "Source"}
+                    clickup_field_names = {f.get("name") for f in fields}
+                    unmatched = excel_fields_needing_match - clickup_field_names
+
+                    if unmatched:
+                        st.session_state["unmatched_fields"] = unmatched
+
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+            # Show validation results
+            if "field_status" in st.session_state:
+                field_status = st.session_state["field_status"]
+                missing_epics = st.session_state.get("missing_epics", set())
+
+                fields_ready = all(f["exists"] and not f.get("missing_options") for f in field_status)
+                epics_ready = len(missing_epics) == 0
+                all_ready = fields_ready and epics_ready
+
+                if all_ready:
+                    st.success("All required fields are configured!")
+                    st.session_state["setup_complete"] = True
+                else:
+                    st.session_state["setup_complete"] = False
+
+                for field in field_status:
+                    if field["exists"] and not field.get("missing_options"):
+                        st.markdown(f"✅ **{field['name']}** - Ready")
+                    elif field["exists"] and field.get("missing_options"):
+                        st.markdown(f"⚠️ **{field['name']}** - Missing options")
+                        with st.expander(f"Add missing options to {field['name']}"):
+                            st.write(f"Missing: {', '.join(field['missing_options'])}")
+                            st.write("Add these options in ClickUp, then click 'Check Fields' again.")
+                    else:
+                        st.markdown(f"❌ **{field['name']}** - Not found")
+                        with st.expander(f"How to create {field['name']}"):
+                            for step in field.get("instructions", []):
+                                st.markdown(step)
+
+                # Show missing Epic options
+                if missing_epics:
+                    st.markdown(f"❌ **Epic Options** - {len(missing_epics)} missing")
+                    with st.expander("Create these Epic options in ClickUp"):
+                        st.write("The following Epic values from your Excel file don't exist in ClickUp:")
+                        for epic in sorted(missing_epics):
+                            st.code(epic, language=None)
+                        st.markdown("---")
+                        st.markdown("**How to add them:**")
+                        st.markdown("1. Open your ClickUp List")
+                        st.markdown("2. Find the **Epic** column")
+                        st.markdown("3. Click on any cell in that column")
+                        st.markdown("4. Click **+ Add Option**")
+                        st.markdown("5. Paste each Epic name **exactly** as shown above")
+                        st.markdown("6. Click **'Check Fields'** again to verify")
+                elif st.session_state.get("required_epics"):
+                    st.markdown("✅ **Epic Options** - All values exist")
+
+                # Show unmatched fields warning
+                unmatched = st.session_state.get("unmatched_fields", set())
+                if unmatched:
+                    st.markdown("---")
+                    st.warning(f"**Fields not found in ClickUp:** {', '.join(unmatched)}")
+                    st.caption("Create these custom fields in ClickUp to auto-map values from Excel")
 
 with col2:
     st.header("Custom Fields")
@@ -306,6 +403,97 @@ with col2:
                 with st.expander("Available Epic Options in ClickUp"):
                     for opt in options:
                         st.text(f"- {opt.get('name')}")
+                continue
+
+            # Auto-map fields from Excel columns (Revised?, Status, Environment, Source)
+            auto_map_fields = {
+                "Revised?": "revised",
+                "Revised": "revised",
+                "Status": "status",
+                "Environment": "environment",
+                "Source": "source"
+            }
+
+            if field_name in auto_map_fields and input_method == "Upload Excel":
+                excel_key = auto_map_fields[field_name]
+                st.success(f"✓ '{field_name}' ({field_type}) → auto-map from Excel")
+
+                # Store field info for auto-mapping
+                if "auto_map_fields" not in st.session_state:
+                    st.session_state["auto_map_fields"] = {}
+
+                options = field.get("type_config", {}).get("options", [])
+                if field_type == "drop_down":
+                    dropdown_options = {opt.get("name"): opt.get("id") for opt in options}
+                    st.session_state["auto_map_fields"][excel_key] = {
+                        "id": field_id,
+                        "type": "drop_down",
+                        "options": dropdown_options
+                    }
+
+                    # Validate Excel values against ClickUp dropdown options
+                    excel_values = st.session_state.get("excel_unique_values", {}).get(excel_key, set())
+                    if excel_values:
+                        missing = []
+                        matched = []
+                        for val in excel_values:
+                            if val in dropdown_options:
+                                matched.append(val)
+                            else:
+                                missing.append(val)
+
+                        if missing:
+                            st.error(f"Missing options: {', '.join(missing)}")
+                            st.session_state.setdefault("missing_field_values", {})[excel_key] = missing
+                            with st.expander(f"Add these options to '{field_name}' in ClickUp"):
+                                for m in missing:
+                                    st.code(m, language=None)
+                        else:
+                            st.caption(f"All values matched: {', '.join(matched)}")
+
+                elif field_type == "labels":
+                    # Store both exact and lowercase versions for flexible matching
+                    label_options = {}
+                    label_options_lower = {}
+                    for opt in options:
+                        label = opt.get("label")
+                        opt_id = opt.get("id")
+                        if label:
+                            label_options[label] = opt_id
+                            label_options_lower[label.lower()] = opt_id
+
+                    st.session_state["auto_map_fields"][excel_key] = {
+                        "id": field_id,
+                        "type": "labels",
+                        "options": label_options,
+                        "options_lower": label_options_lower
+                    }
+
+                    # Validate Excel values against ClickUp labels
+                    excel_values = st.session_state.get("excel_unique_values", {}).get(excel_key, set())
+                    if excel_values:
+                        missing = []
+                        matched = []
+                        for val in excel_values:
+                            if val in label_options or val.lower() in label_options_lower:
+                                matched.append(val)
+                            else:
+                                missing.append(val)
+
+                        if missing:
+                            st.error(f"Missing labels: {', '.join(missing)}")
+                            st.session_state.setdefault("missing_field_values", {})[excel_key] = missing
+                        else:
+                            st.caption(f"All values matched: {', '.join(matched)}")
+
+                elif field_type == "checkbox":
+                    # Checkbox field - "Yes" maps to True, anything else to False
+                    st.session_state["auto_map_fields"][excel_key] = {
+                        "id": field_id,
+                        "type": "checkbox"
+                    }
+                    st.caption("'Yes' in Excel → checked, other values → unchecked")
+
                 continue
 
             # Enable checkbox
@@ -363,6 +551,38 @@ with col2:
                     )
                     custom_field_values[field_id] = value
 
+                elif field_type == "labels":
+                    options = field.get("type_config", {}).get("options", [])
+                    # Labels use "label" property instead of "name"
+                    option_labels = [opt.get("label") for opt in options]
+
+                    if option_labels and any(option_labels):
+                        # Parse default value (could be a list or comma-separated string)
+                        default_selections = []
+                        if default_value:
+                            if isinstance(default_value, list):
+                                default_selections = [v for v in default_value if v in option_labels]
+                            elif isinstance(default_value, str):
+                                default_selections = [v.strip() for v in default_value.split(",") if v.strip() in option_labels]
+
+                        selected = st.multiselect(
+                            field_name,
+                            options=option_labels,
+                            default=default_selections,
+                            key=f"value_{field_id}",
+                            help="Select one or more labels"
+                        )
+
+                        if selected:
+                            # Labels field expects a list of option IDs
+                            selected_ids = []
+                            for opt in options:
+                                if opt.get("label") in selected:
+                                    selected_ids.append(opt.get("id"))
+                            custom_field_values[field_id] = selected_ids
+                    else:
+                        st.warning(f"No labels defined for '{field_name}' - create labels in ClickUp first")
+
                 else:
                     st.info(f"Field type '{field_type}' - enter value manually")
                     value = st.text_input(
@@ -373,11 +593,35 @@ with col2:
                     if value:
                         custom_field_values[field_id] = value
     else:
-        st.info("Enter List ID and click 'Load Custom Fields' to see available fields")
+        st.info("Load tasks and click 'Check Fields' in Step 2 to see available fields")
 
 # Create Tasks Section
 st.markdown("---")
 st.header("Create Tasks")
+
+# Show auto-mapped fields summary
+if "auto_map_fields" in st.session_state and st.session_state["auto_map_fields"]:
+    with st.expander("🔄 Auto-mapped Fields (Debug)", expanded=True):
+        for key, info in st.session_state["auto_map_fields"].items():
+            field_type = info.get("type", "unknown")
+            if field_type == "labels":
+                options = list(info.get("options", {}).keys())
+                st.write(f"**{key}** (labels): {options}")
+            elif field_type == "drop_down":
+                options = list(info.get("options", {}).keys())
+                st.write(f"**{key}** (dropdown): {options}")
+            elif field_type == "checkbox":
+                st.write(f"**{key}** (checkbox): Yes → checked")
+
+        # Show sample task values
+        if tasks:
+            st.markdown("---")
+            st.write("**Sample task values from Excel:**")
+            sample = tasks[0]
+            st.write(f"- revised: `{sample.get('revised')}`")
+            st.write(f"- status: `{sample.get('status')}`")
+            st.write(f"- environment: `{sample.get('environment')}`")
+            st.write(f"- source: `{sample.get('source')}`")
 
 if custom_field_values:
     st.write("**Custom fields to apply:**")
@@ -395,9 +639,9 @@ if tasks and api_token and list_id:
     fields_checked = "field_status" in st.session_state
 
     if not fields_checked:
-        st.warning("Click **'Check Fields'** in the sidebar first to verify custom fields are set up.")
+        st.warning("Click **'Check Fields'** in Step 2 above to verify custom fields are set up.")
     elif not setup_complete:
-        st.error("Some required custom fields are missing. See **Setup Status** in the sidebar for instructions.")
+        st.error("Some required custom fields are missing. See the validation results in Step 2 above.")
 
     # Option to link related tasks (only for Excel imports with Epics)
     has_epics = any(t.get("epic") for t in tasks)
@@ -410,14 +654,22 @@ if tasks and api_token and list_id:
         )
 
     # Only enable Create Tasks if setup is complete (or no required fields defined)
-    # Also check that all Epic options exist
+    # Also check that all Epic options exist and all field values are matched
     no_required_fields = not config.get("required_custom_fields")
     missing_epics = st.session_state.get("missing_epics", set())
-    can_create = (setup_complete or no_required_fields) and len(missing_epics) == 0
+    missing_field_values = st.session_state.get("missing_field_values", {})
+    has_missing_values = any(missing_field_values.values())
 
-    # Show warning if Epic options are missing
+    can_create = (setup_complete or no_required_fields) and len(missing_epics) == 0 and not has_missing_values
+
+    # Show warnings for missing values
     if missing_epics:
-        st.error(f"{len(missing_epics)} Epic option(s) missing in ClickUp. See **Setup Status** in sidebar.")
+        st.error(f"{len(missing_epics)} Epic option(s) missing in ClickUp. See validation results in Step 2 above.")
+
+    if has_missing_values:
+        for field_key, missing in missing_field_values.items():
+            if missing:
+                st.error(f"Missing '{field_key}' values: {', '.join(missing)} - add them in ClickUp first")
 
     if st.button("Create Tasks", type="primary", disabled=not can_create):
         # Get Epic field info if available
@@ -449,6 +701,56 @@ if tasks and api_token and list_id:
                 epic_option_id = epic_field_info["options"].get(task_epic)
                 if epic_option_id:
                     cf_list.append({"id": epic_field_info["id"], "value": epic_option_id})
+
+            # Add auto-mapped fields from Excel (Revised?, Status, Environment, Source)
+            auto_map_fields = st.session_state.get("auto_map_fields", {})
+
+            # Map Revised? field (can be checkbox or dropdown)
+            if "revised" in auto_map_fields and task.get("revised"):
+                field_info = auto_map_fields["revised"]
+                if field_info["type"] == "checkbox":
+                    # Checkbox: "Yes" → True, anything else → False
+                    is_checked = task["revised"].lower() in ["yes", "true", "1"]
+                    cf_list.append({"id": field_info["id"], "value": is_checked})
+                elif field_info["type"] == "drop_down":
+                    option_id = field_info["options"].get(task["revised"])
+                    if option_id:
+                        cf_list.append({"id": field_info["id"], "value": option_id})
+
+            # Map Status field
+            if "status" in auto_map_fields and task.get("status"):
+                field_info = auto_map_fields["status"]
+                option_id = field_info["options"].get(task["status"])
+                if option_id:
+                    cf_list.append({"id": field_info["id"], "value": option_id})
+
+            # Map Source field
+            if "source" in auto_map_fields and task.get("source"):
+                field_info = auto_map_fields["source"]
+                option_id = field_info["options"].get(task["source"])
+                if option_id:
+                    cf_list.append({"id": field_info["id"], "value": option_id})
+
+            # Map Environment field (labels/multi-select)
+            if "environment" in auto_map_fields and task.get("environment"):
+                field_info = auto_map_fields["environment"]
+                if field_info["type"] == "labels":
+                    # Labels field expects a list of option IDs
+                    selected_ids = []
+                    for env_val in task["environment"]:
+                        # Try exact match first, then case-insensitive
+                        option_id = field_info["options"].get(env_val)
+                        if not option_id and "options_lower" in field_info:
+                            option_id = field_info["options_lower"].get(env_val.lower())
+                        if option_id:
+                            selected_ids.append(option_id)
+                    if selected_ids:
+                        cf_list.append({"id": field_info["id"], "value": selected_ids})
+                elif field_info["type"] == "drop_down":
+                    # For dropdown, just use the first value
+                    option_id = field_info["options"].get(task["environment"][0])
+                    if option_id:
+                        cf_list.append({"id": field_info["id"], "value": option_id})
 
             success, msg = create_task(list_id, task_name, task_desc, cf_list, api_token)
 
