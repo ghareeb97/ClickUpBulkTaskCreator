@@ -1,0 +1,33 @@
+{
+  "default_custom_fields": {
+    "Source": "Internal"
+  },
+  "required_custom_fields": [
+    {
+      "name": "Source",
+      "type": "drop_down",
+      "required_options": ["Internal"],
+      "instructions": [
+        "1. Open your ClickUp List",
+        "2. Click '+ Add Column' or the '+' icon in List view",
+        "3. Select 'Dropdown' field type",
+        "4. Name it exactly: **Source**",
+        "5. Add options: Internal, External, Customer (or your own)",
+        "6. Click 'Create'"
+      ]
+    },
+    {
+      "name": "Epic",
+      "type": "drop_down",
+      "required_options": [],
+      "instructions": [
+        "1. Open your ClickUp List",
+        "2. Click '+ Add Column' or the '+' icon in List view",
+        "3. Select 'Dropdown' field type",
+        "4. Name it exactly: **Epic**",
+        "5. Leave options empty (they'll be auto-created from Excel)",
+        "6. Click 'Create'"
+      ]
+    }
+  ]
+}
