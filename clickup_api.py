@@ -10,6 +10,30 @@ def get_headers(api_token):
     }
 
 
+def get_list_details(list_id, api_token):
+    """Fetch details about a ClickUp list including name, folder, and space.
+
+    Returns:
+        dict with keys: id, name, folder (dict with id, name), space (dict with id, name),
+        task_count, status (list of statuses)
+    """
+    url = f"{BASE_URL}/list/{list_id}"
+    response = requests.get(url, headers=get_headers(api_token))
+
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch list: {response.status_code} - {response.text}")
+
+    data = response.json()
+    return {
+        "id": data.get("id"),
+        "name": data.get("name"),
+        "folder": data.get("folder", {}),
+        "space": data.get("space", {}),
+        "task_count": data.get("task_count"),
+        "statuses": data.get("statuses", [])
+    }
+
+
 def get_custom_fields(list_id, api_token):
     """Fetch custom fields for a ClickUp list."""
     url = f"{BASE_URL}/list/{list_id}/field"

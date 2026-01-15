@@ -1,7 +1,7 @@
 import streamlit as st
 import json
 import re
-from clickup_api import get_custom_fields, create_task, link_tasks
+from clickup_api import get_custom_fields, create_task, link_tasks, get_list_details
 from excel_parser import get_sheet_names, parse_excel_workbook
 
 # Load config defaults
@@ -10,6 +10,22 @@ try:
         config = json.load(f)
 except FileNotFoundError:
     config = {"default_custom_fields": {}, "required_custom_fields": []}
+
+# Load saved settings
+SETTINGS_FILE = "saved_settings.json"
+
+def load_saved_settings():
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+saved_settings = load_saved_settings()
 
 def check_required_fields(actual_fields, required_fields):
     """Check which required fields exist and which are missing."""
@@ -67,10 +83,69 @@ with st.sidebar:
         help="Your ClickUp API token"
     )
 
+    # List ID with saved value
+    saved_list_id = saved_settings.get("list_id", "")
     list_id = st.text_input(
         "List ID",
+        value=saved_list_id,
         help="The ClickUp List ID where tasks will be created"
     )
+
+    # Save list ID when changed
+    if list_id and list_id != saved_list_id:
+        saved_settings["list_id"] = list_id
+        save_settings(saved_settings)
+
+    # Fetch and display list details
+    if api_token and list_id:
+        # Use session state to cache list details
+        cache_key = f"list_details_{list_id}"
+        if cache_key not in st.session_state:
+            try:
+                with st.spinner("Loading list..."):
+                    list_details = get_list_details(list_id, api_token)
+                    st.session_state[cache_key] = list_details
+            except Exception as e:
+                st.session_state[cache_key] = {"error": str(e)}
+
+        list_info = st.session_state.get(cache_key, {})
+
+        if "error" in list_info:
+            st.error(f"Invalid List ID: {list_info['error'][:50]}")
+        else:
+            st.markdown("---")
+            st.markdown("**Target List**")
+            st.success(f"📋 {list_info.get('name', 'Unknown')}")
+
+            # Show hierarchy
+            folder = list_info.get("folder", {})
+            space = list_info.get("space", {})
+            if space.get("name") or folder.get("name"):
+                hierarchy = []
+                if space.get("name"):
+                    hierarchy.append(space["name"])
+                if folder.get("name") and not folder.get("hidden"):
+                    hierarchy.append(folder["name"])
+                st.caption(f"📂 {' / '.join(hierarchy)}")
+
+            # Show task count
+            task_count = list_info.get("task_count")
+            if task_count is not None:
+                st.caption(f"📝 {task_count} existing tasks")
+
+            # Show available statuses
+            statuses = list_info.get("statuses", [])
+            if statuses:
+                with st.expander("Available Statuses", expanded=False):
+                    for s in statuses:
+                        color = s.get("color", "#808080")
+                        st.markdown(f"<span style='color:{color}'>●</span> {s.get('status')}", unsafe_allow_html=True)
+
+            # Button to refresh list details
+            if st.button("🔄 Refresh", help="Reload list details"):
+                if cache_key in st.session_state:
+                    del st.session_state[cache_key]
+                st.rerun()
 
 # ============================================================
 # STEP 1: Select Tasks
@@ -214,29 +289,251 @@ elif input_method == "Upload Excel":
 
 # Tasks Preview
 if tasks:
-    with st.expander(f"Preview ({len(tasks)} tasks)", expanded=False):
-        for i, task in enumerate(tasks[:10]):
-            task_name = task.get('name', 'Unnamed')
+    st.subheader("Tasks Preview")
 
-            # Build compact field summary
-            tags = []
-            if task.get('epic'):
-                tags.append(f"Epic: {task.get('epic')}")
-            if task.get('status'):
-                tags.append(task.get('status'))
-            if task.get('environment'):
-                env = task.get('environment')
-                env_str = ", ".join(env) if isinstance(env, list) else env
-                tags.append(env_str)
+    # Preview view options
+    preview_col1, preview_col2 = st.columns([1, 3])
+    with preview_col1:
+        view_mode = st.radio(
+            "View mode",
+            ["By Epic", "List View", "Detailed Cards"],
+            horizontal=True,
+            label_visibility="collapsed"
+        )
 
-            if tags:
-                st.text(f"{i+1}. {task_name}")
-                st.caption(f"   {' | '.join(tags)}")
-            else:
-                st.text(f"{i+1}. {task_name}")
+    # Group tasks by Epic for related task linking
+    tasks_by_epic = {}
+    tasks_without_epic = []
+    for task in tasks:
+        epic = task.get('epic')
+        if epic:
+            if epic not in tasks_by_epic:
+                tasks_by_epic[epic] = []
+            tasks_by_epic[epic].append(task)
+        else:
+            tasks_without_epic.append(task)
 
-        if len(tasks) > 10:
-            st.text(f"... and {len(tasks) - 10} more")
+    if view_mode == "By Epic":
+        # Show tasks grouped by Epic with related task information
+        for epic_name, epic_tasks in tasks_by_epic.items():
+            with st.expander(f"📁 {epic_name} ({len(epic_tasks)} tasks)", expanded=False):
+                # Show Epic description if available
+                if epic_tasks and epic_tasks[0].get('epic_info', {}).get('epic_description'):
+                    st.caption(epic_tasks[0]['epic_info']['epic_description'][:200] + "..."
+                              if len(epic_tasks[0]['epic_info']['epic_description']) > 200
+                              else epic_tasks[0]['epic_info']['epic_description'])
+
+                st.markdown("**Related Tasks in this Epic:**")
+                related_ids = [t.get('user_story_id', '') for t in epic_tasks]
+                st.caption(f"🔗 {', '.join(related_ids)}")
+
+                st.markdown("---")
+
+                for task in epic_tasks:
+                    with st.container():
+                        # Task header
+                        st.markdown(f"**{task.get('name', 'Unnamed')}**")
+
+                        # Field badges row
+                        field_cols = st.columns(5)
+                        with field_cols[0]:
+                            if task.get('status'):
+                                st.caption(f"📊 {task['status']}")
+                        with field_cols[1]:
+                            if task.get('revised'):
+                                st.caption(f"✏️ Revised: {task['revised']}")
+                        with field_cols[2]:
+                            if task.get('environment'):
+                                env = task['environment']
+                                env_str = ", ".join(env) if isinstance(env, list) else env
+                                st.caption(f"🖥️ {env_str}")
+                        with field_cols[3]:
+                            if task.get('source'):
+                                st.caption(f"📥 {task['source']}")
+                        with field_cols[4]:
+                            if task.get('_source_sheet'):
+                                st.caption(f"📄 {task['_source_sheet']}")
+
+                        # Description preview
+                        if task.get('description'):
+                            desc_preview = task['description'][:150].replace('\n', ' ')
+                            if len(task['description']) > 150:
+                                desc_preview += "..."
+                            st.caption(desc_preview)
+
+                        st.markdown("---")
+
+        # Show tasks without Epic
+        if tasks_without_epic:
+            with st.expander(f"📋 No Epic Assigned ({len(tasks_without_epic)} tasks)", expanded=False):
+                for task in tasks_without_epic:
+                    st.markdown(f"• {task.get('name', 'Unnamed')}")
+                    if task.get('status'):
+                        st.caption(f"  Status: {task['status']}")
+
+    elif view_mode == "List View":
+        # Compact list view with all key fields
+        with st.expander(f"📋 All Tasks ({len(tasks)} total)", expanded=True):
+            # Create a table-like header
+            header_cols = st.columns([3, 2, 1, 1, 1, 1])
+            header_cols[0].markdown("**Task Name**")
+            header_cols[1].markdown("**Epic**")
+            header_cols[2].markdown("**Status**")
+            header_cols[3].markdown("**Revised**")
+            header_cols[4].markdown("**Env**")
+            header_cols[5].markdown("**Source**")
+
+            st.markdown("---")
+
+            for task in tasks[:25]:  # Show first 25
+                cols = st.columns([3, 2, 1, 1, 1, 1])
+
+                # Task name (truncate if too long)
+                name = task.get('name', 'Unnamed')
+                cols[0].text(name[:40] + "..." if len(name) > 40 else name)
+
+                # Epic (truncate)
+                epic = task.get('epic', '-')
+                if epic and len(epic) > 25:
+                    epic = epic[:25] + "..."
+                cols[1].caption(epic or "-")
+
+                # Status
+                cols[2].caption(task.get('status', '-') or "-")
+
+                # Revised
+                cols[3].caption(task.get('revised', '-') or "-")
+
+                # Environment
+                env = task.get('environment', [])
+                env_str = ", ".join(env) if isinstance(env, list) else (env or "-")
+                cols[4].caption(env_str[:10] + "..." if len(env_str) > 10 else env_str)
+
+                # Source
+                cols[5].caption(task.get('source', '-') or "-")
+
+            if len(tasks) > 25:
+                st.caption(f"... and {len(tasks) - 25} more tasks")
+
+    elif view_mode == "Detailed Cards":
+        # Detailed card view with full information
+        num_to_show = st.slider("Tasks to preview", 1, min(10, len(tasks)), min(3, len(tasks)))
+
+        for i, task in enumerate(tasks[:num_to_show]):
+            with st.expander(f"📝 {task.get('name', 'Unnamed')}", expanded=(i == 0)):
+                # Two-column layout for task details
+                left_col, right_col = st.columns(2)
+
+                with left_col:
+                    st.markdown("#### Task Details")
+                    st.markdown(f"**ID:** `{task.get('user_story_id', 'N/A')}`")
+                    st.markdown(f"**Name:** {task.get('name', 'Unnamed')}")
+
+                    if task.get('_source_sheet'):
+                        st.markdown(f"**Source:** {task['_source_sheet']} (Row {task.get('_source_row', '?')})")
+
+                with right_col:
+                    st.markdown("#### Custom Fields")
+
+                    # Epic
+                    if task.get('epic'):
+                        st.markdown(f"**📁 Epic:** {task['epic']}")
+                    else:
+                        st.markdown("**📁 Epic:** _Not assigned_")
+
+                    # Status
+                    if task.get('status'):
+                        st.markdown(f"**📊 Status:** {task['status']}")
+
+                    # Revised
+                    if task.get('revised'):
+                        revised_icon = "✅" if task['revised'].lower() == "yes" else "❌"
+                        st.markdown(f"**✏️ Revised:** {revised_icon} {task['revised']}")
+
+                    # Environment
+                    if task.get('environment'):
+                        env = task['environment']
+                        env_str = ", ".join(env) if isinstance(env, list) else env
+                        st.markdown(f"**🖥️ Environment:** {env_str}")
+
+                    # Source
+                    if task.get('source'):
+                        st.markdown(f"**📥 Source:** {task['source']}")
+
+                # Description section
+                st.markdown("#### Description")
+                if task.get('description'):
+                    desc = task['description']
+                    # Use checkbox to toggle full description
+                    if len(desc) > 300:
+                        show_full = st.checkbox("Show full description", key=f"desc_{task.get('user_story_id', i)}")
+                        if show_full:
+                            st.markdown(desc)
+                        else:
+                            st.markdown(desc[:300] + "...")
+                    else:
+                        st.markdown(desc)
+                else:
+                    st.caption("_No description_")
+
+                # Related tasks section
+                if task.get('epic') and task['epic'] in tasks_by_epic:
+                    related = tasks_by_epic[task['epic']]
+                    other_related = [t for t in related if t.get('user_story_id') != task.get('user_story_id')]
+
+                    if other_related:
+                        st.markdown("#### 🔗 Related Tasks (Same Epic)")
+                        related_names = [f"`{t.get('user_story_id')}`" for t in other_related[:5]]
+                        st.markdown(" • ".join(related_names))
+                        if len(other_related) > 5:
+                            st.caption(f"... and {len(other_related) - 5} more")
+
+        if len(tasks) > num_to_show:
+            st.info(f"Showing {num_to_show} of {len(tasks)} tasks. Adjust slider to see more.")
+
+    # Summary statistics
+    with st.expander("📊 Import Summary", expanded=False):
+        stat_cols = st.columns(4)
+
+        with stat_cols[0]:
+            st.metric("Total Tasks", len(tasks))
+
+        with stat_cols[1]:
+            with_epic = sum(1 for t in tasks if t.get('epic'))
+            st.metric("With Epic", with_epic)
+
+        with stat_cols[2]:
+            st.metric("Unique Epics", len(tasks_by_epic))
+
+        with stat_cols[3]:
+            unique_statuses = set(t.get('status') for t in tasks if t.get('status'))
+            st.metric("Statuses", len(unique_statuses))
+
+        # Show what will happen
+        st.markdown("---")
+        st.markdown("**What will be created:**")
+        st.markdown(f"• **{len(tasks)}** new tasks in ClickUp")
+
+        if tasks_by_epic:
+            total_links = sum(len(epic_tasks) - 1 for epic_tasks in tasks_by_epic.values() if len(epic_tasks) > 1)
+            if total_links > 0:
+                st.markdown(f"• **{total_links}** task relationships (related tasks within same Epic)")
+
+        # Field mapping summary
+        field_summary = []
+        if any(t.get('epic') for t in tasks):
+            field_summary.append("Epic")
+        if any(t.get('status') for t in tasks):
+            field_summary.append("Status")
+        if any(t.get('revised') for t in tasks):
+            field_summary.append("Revised")
+        if any(t.get('environment') for t in tasks):
+            field_summary.append("Environment")
+        if any(t.get('source') for t in tasks):
+            field_summary.append("Source")
+
+        if field_summary:
+            st.markdown(f"• **Custom Fields:** {', '.join(field_summary)}")
 
 # ============================================================
 # STEP 2: Validate ClickUp Fields
@@ -596,205 +893,202 @@ if "custom_fields" in st.session_state and st.session_state["custom_fields"]:
 # ============================================================
 # STEP 4: Create Tasks
 # ============================================================
-st.markdown("---")
-st.header("Step 4: Create Tasks")
+# Only show Step 4 after fields have been checked in Step 2
+if tasks and "field_status" in st.session_state:
+    st.markdown("---")
+    st.header("Step 4: Create Tasks")
 
-if custom_field_values:
-    with st.expander("Custom fields to apply"):
-        for field_id, value in custom_field_values.items():
-            # Find field name
-            if "custom_fields" in st.session_state:
-                for f in st.session_state["custom_fields"]:
-                    if f.get("id") == field_id:
-                        st.write(f"- {f.get('name')}: {value}")
-                        break
+    if custom_field_values:
+        with st.expander("Custom fields to apply"):
+            for field_id, value in custom_field_values.items():
+                # Find field name
+                if "custom_fields" in st.session_state:
+                    for f in st.session_state["custom_fields"]:
+                        if f.get("id") == field_id:
+                            st.write(f"- {f.get('name')}: {value}")
+                            break
 
-if tasks and api_token and list_id:
-    # Check if setup is complete
-    setup_complete = st.session_state.get("setup_complete", False)
-    fields_checked = "field_status" in st.session_state
+    if api_token and list_id:
+        # Check if setup is complete
+        setup_complete = st.session_state.get("setup_complete", False)
 
-    if not fields_checked:
-        st.warning("Click **'Check Fields'** in Step 2 to verify custom fields are set up.")
-    elif not setup_complete:
-        st.error("Some required custom fields are missing. See the validation results in Step 2.")
+        if not setup_complete:
+            st.error("Some required custom fields are missing. See the validation results in Step 2.")
 
-    # Option to link related tasks (only for Excel imports with Epics)
-    has_epics = any(t.get("epic") for t in tasks)
-    link_related = False
-    if has_epics and input_method == "Upload Excel":
-        link_related = st.checkbox(
-            "Link related user stories within same Epic",
-            value=True,
-            help="Creates 'related to' links between all user stories that share the same Epic"
-        )
+        # Option to link related tasks (only for Excel imports with Epics)
+        has_epics = any(t.get("epic") for t in tasks)
+        link_related = False
+        if has_epics and input_method == "Upload Excel":
+            link_related = st.checkbox(
+                "Link related user stories within same Epic",
+                value=True,
+                help="Creates 'related to' links between all user stories that share the same Epic"
+            )
 
-    # Only enable Create Tasks if setup is complete (or no required fields defined)
-    # Also check that all Epic options exist and all field values are matched
-    no_required_fields = not config.get("required_custom_fields")
-    missing_epics = st.session_state.get("missing_epics", set())
-    missing_field_values = st.session_state.get("missing_field_values", {})
-    has_missing_values = any(missing_field_values.values())
+        # Only enable Create Tasks if setup is complete (or no required fields defined)
+        # Also check that all Epic options exist and all field values are matched
+        no_required_fields = not config.get("required_custom_fields")
+        missing_epics = st.session_state.get("missing_epics", set())
+        missing_field_values = st.session_state.get("missing_field_values", {})
+        has_missing_values = any(missing_field_values.values())
 
-    can_create = (setup_complete or no_required_fields) and len(missing_epics) == 0 and not has_missing_values
+        can_create = (setup_complete or no_required_fields) and len(missing_epics) == 0 and not has_missing_values
 
-    # Show warnings for missing values
-    if missing_epics:
-        st.error(f"{len(missing_epics)} Epic option(s) missing in ClickUp. See validation results in Step 2.")
+        # Show warnings for missing values
+        if missing_epics:
+            st.error(f"{len(missing_epics)} Epic option(s) missing in ClickUp. See validation results in Step 2.")
 
-    if has_missing_values:
-        for field_key, missing in missing_field_values.items():
-            if missing:
-                st.error(f"Missing '{field_key}' values: {', '.join(missing)} - add them in ClickUp first")
+        if has_missing_values:
+            for field_key, missing in missing_field_values.items():
+                if missing:
+                    st.error(f"Missing '{field_key}' values: {', '.join(missing)} - add them in ClickUp first")
 
-    if st.button("Create Tasks", type="primary", disabled=not can_create):
-        # Get Epic field info if available
-        epic_field_info = st.session_state.get("epic_field_info")
+        if st.button("Create Tasks", type="primary", disabled=not can_create):
+            # Get Epic field info if available
+            epic_field_info = st.session_state.get("epic_field_info")
 
-        progress = st.progress(0)
-        status = st.empty()
-        results = {"success": 0, "failed": 0, "links_created": 0}
+            progress = st.progress(0)
+            status = st.empty()
+            results = {"success": 0, "failed": 0, "links_created": 0}
 
-        # Track created task IDs by Epic for linking
-        epic_task_ids = {}  # epic_name -> [task_id1, task_id2, ...]
+            # Track created task IDs by Epic for linking
+            epic_task_ids = {}  # epic_name -> [task_id1, task_id2, ...]
 
-        # Create all tasks
-        total_steps = len(tasks)
-        if link_related:
-            # We'll need additional steps for linking
-            total_steps = len(tasks)  # Progress will reset for linking phase
+            # Create all tasks
+            total_steps = len(tasks)
+            if link_related:
+                # We'll need additional steps for linking
+                total_steps = len(tasks)  # Progress will reset for linking phase
 
-        for i, task in enumerate(tasks):
-            task_name = task.get("name", "Unnamed")
-            task_desc = task.get("description", "")
-            task_epic = task.get("epic")
+            for i, task in enumerate(tasks):
+                task_name = task.get("name", "Unnamed")
+                task_desc = task.get("description", "")
+                task_epic = task.get("epic")
 
-            # Build custom fields list for this specific task
-            cf_list = [{"id": fid, "value": val} for fid, val in custom_field_values.items()]
+                # Build custom fields list for this specific task
+                cf_list = [{"id": fid, "value": val} for fid, val in custom_field_values.items()]
 
-            # Add Epic custom field if applicable
-            if task_epic and epic_field_info:
-                epic_option_id = epic_field_info["options"].get(task_epic)
-                if epic_option_id:
-                    cf_list.append({"id": epic_field_info["id"], "value": epic_option_id})
+                # Add Epic custom field if applicable
+                if task_epic and epic_field_info:
+                    epic_option_id = epic_field_info["options"].get(task_epic)
+                    if epic_option_id:
+                        cf_list.append({"id": epic_field_info["id"], "value": epic_option_id})
 
-            # Add auto-mapped fields from Excel (Revised?, Status, Environment, Source)
-            auto_map_fields = st.session_state.get("auto_map_fields", {})
+                # Add auto-mapped fields from Excel (Revised?, Status, Environment, Source)
+                auto_map_fields = st.session_state.get("auto_map_fields", {})
 
-            # Map Revised? field (can be checkbox or dropdown)
-            if "revised" in auto_map_fields and task.get("revised"):
-                field_info = auto_map_fields["revised"]
-                if field_info["type"] == "checkbox":
-                    # Checkbox: "Yes" → True, anything else → False
-                    is_checked = task["revised"].lower() in ["yes", "true", "1"]
-                    cf_list.append({"id": field_info["id"], "value": is_checked})
-                elif field_info["type"] == "drop_down":
-                    option_id = field_info["options"].get(task["revised"])
-                    if option_id:
-                        cf_list.append({"id": field_info["id"], "value": option_id})
-
-            # Map Status field (can be custom field dropdown OR native task status)
-            task_status = None
-            if "status" in auto_map_fields and task.get("status"):
-                field_info = auto_map_fields["status"]
-                if field_info["type"] == "drop_down":
-                    option_id = field_info["options"].get(task["status"])
-                    if option_id:
-                        cf_list.append({"id": field_info["id"], "value": option_id})
-                elif field_info["type"] == "native":
-                    # Native task status - will be passed separately
-                    task_status = task["status"]
-            elif task.get("status"):
-                # No custom field found - assume it's native status
-                task_status = task["status"]
-
-            # Map Source field
-            if "source" in auto_map_fields and task.get("source"):
-                field_info = auto_map_fields["source"]
-                option_id = field_info["options"].get(task["source"])
-                if option_id:
-                    cf_list.append({"id": field_info["id"], "value": option_id})
-
-            # Map Environment field (labels/multi-select)
-            if "environment" in auto_map_fields and task.get("environment"):
-                field_info = auto_map_fields["environment"]
-                if field_info["type"] == "labels":
-                    # Labels field expects a list of option IDs
-                    selected_ids = []
-                    for env_val in task["environment"]:
-                        # Try exact match first, then case-insensitive, then stripped (no emoji)
-                        option_id = field_info["options"].get(env_val)
-                        if not option_id and "options_lower" in field_info:
-                            option_id = field_info["options_lower"].get(env_val.lower())
-                        if not option_id and "options_stripped" in field_info:
-                            option_id = field_info["options_stripped"].get(env_val.lower())
+                # Map Revised? field (can be checkbox or dropdown)
+                if "revised" in auto_map_fields and task.get("revised"):
+                    field_info = auto_map_fields["revised"]
+                    if field_info["type"] == "checkbox":
+                        # Checkbox: "Yes" → True, anything else → False
+                        is_checked = task["revised"].lower() in ["yes", "true", "1"]
+                        cf_list.append({"id": field_info["id"], "value": is_checked})
+                    elif field_info["type"] == "drop_down":
+                        option_id = field_info["options"].get(task["revised"])
                         if option_id:
-                            selected_ids.append(option_id)
-                    if selected_ids:
-                        cf_list.append({"id": field_info["id"], "value": selected_ids})
-                elif field_info["type"] == "drop_down":
-                    # For dropdown, just use the first value
-                    option_id = field_info["options"].get(task["environment"][0])
+                            cf_list.append({"id": field_info["id"], "value": option_id})
+
+                # Map Status field (can be custom field dropdown OR native task status)
+                task_status = None
+                if "status" in auto_map_fields and task.get("status"):
+                    field_info = auto_map_fields["status"]
+                    if field_info["type"] == "drop_down":
+                        option_id = field_info["options"].get(task["status"])
+                        if option_id:
+                            cf_list.append({"id": field_info["id"], "value": option_id})
+                    elif field_info["type"] == "native":
+                        # Native task status - will be passed separately
+                        task_status = task["status"]
+                elif task.get("status"):
+                    # No custom field found - assume it's native status
+                    task_status = task["status"]
+
+                # Map Source field
+                if "source" in auto_map_fields and task.get("source"):
+                    field_info = auto_map_fields["source"]
+                    option_id = field_info["options"].get(task["source"])
                     if option_id:
                         cf_list.append({"id": field_info["id"], "value": option_id})
 
-            success, msg = create_task(list_id, task_name, task_desc, cf_list, api_token, status=task_status)
+                # Map Environment field (labels/multi-select)
+                if "environment" in auto_map_fields and task.get("environment"):
+                    field_info = auto_map_fields["environment"]
+                    if field_info["type"] == "labels":
+                        # Labels field expects a list of option IDs
+                        selected_ids = []
+                        for env_val in task["environment"]:
+                            # Try exact match first, then case-insensitive, then stripped (no emoji)
+                            option_id = field_info["options"].get(env_val)
+                            if not option_id and "options_lower" in field_info:
+                                option_id = field_info["options_lower"].get(env_val.lower())
+                            if not option_id and "options_stripped" in field_info:
+                                option_id = field_info["options_stripped"].get(env_val.lower())
+                            if option_id:
+                                selected_ids.append(option_id)
+                        if selected_ids:
+                            cf_list.append({"id": field_info["id"], "value": selected_ids})
+                    elif field_info["type"] == "drop_down":
+                        # For dropdown, just use the first value
+                        option_id = field_info["options"].get(task["environment"][0])
+                        if option_id:
+                            cf_list.append({"id": field_info["id"], "value": option_id})
 
-            if success:
-                results["success"] += 1
-                status.text(f"Created: {task_name}")
+                success, msg = create_task(list_id, task_name, task_desc, cf_list, api_token, status=task_status)
 
-                # Extract task ID from response for linking
-                if link_related and task_epic:
-                    # The create_task function returns (True, "Created successfully")
-                    # We need to modify it to return the task ID, or fetch tasks after
-                    # For now, we'll track by name and fetch IDs after
-                    if task_epic not in epic_task_ids:
-                        epic_task_ids[task_epic] = []
-                    epic_task_ids[task_epic].append(task_name)
-            else:
-                results["failed"] += 1
-                status.text(f"Failed: {task_name} - {msg}")
+                if success:
+                    results["success"] += 1
+                    status.text(f"Created: {task_name}")
 
-            progress.progress((i + 1) / len(tasks))
+                    # Extract task ID from response for linking
+                    if link_related and task_epic:
+                        # The create_task function returns (True, "Created successfully")
+                        # We need to modify it to return the task ID, or fetch tasks after
+                        # For now, we'll track by name and fetch IDs after
+                        if task_epic not in epic_task_ids:
+                            epic_task_ids[task_epic] = []
+                        epic_task_ids[task_epic].append(task_name)
+                else:
+                    results["failed"] += 1
+                    status.text(f"Failed: {task_name} - {msg}")
 
-        # Phase 2: Link related tasks within each Epic
-        if link_related and epic_task_ids:
-            status.text("Linking related tasks...")
-            from clickup_api import get_tasks
+                progress.progress((i + 1) / len(tasks))
 
-            # Fetch all created tasks to get their IDs
-            try:
-                all_tasks_in_list = get_tasks(list_id, api_token)
-                task_name_to_id = {t["name"]: t["id"] for t in all_tasks_in_list}
+            # Phase 2: Link related tasks within each Epic
+            if link_related and epic_task_ids:
+                status.text("Linking related tasks...")
+                from clickup_api import get_tasks
 
-                # Link tasks within each Epic
-                for epic_name, task_names in epic_task_ids.items():
-                    task_ids = [task_name_to_id.get(name) for name in task_names]
-                    task_ids = [tid for tid in task_ids if tid]  # Filter out None
+                # Fetch all created tasks to get their IDs
+                try:
+                    all_tasks_in_list = get_tasks(list_id, api_token)
+                    task_name_to_id = {t["name"]: t["id"] for t in all_tasks_in_list}
 
-                    if len(task_ids) >= 2:
-                        # Link each task to the next one (chain)
-                        for j in range(len(task_ids) - 1):
-                            success, _ = link_tasks(task_ids[j], task_ids[j + 1], api_token)
-                            if success:
-                                results["links_created"] += 1
+                    # Link tasks within each Epic
+                    for epic_name, task_names in epic_task_ids.items():
+                        task_ids = [task_name_to_id.get(name) for name in task_names]
+                        task_ids = [tid for tid in task_ids if tid]  # Filter out None
 
-                status.text("Linking complete!")
-            except Exception as e:
-                status.text(f"Error linking tasks: {e}")
+                        if len(task_ids) >= 2:
+                            # Link each task to the next one (chain)
+                            for j in range(len(task_ids) - 1):
+                                success, _ = link_tasks(task_ids[j], task_ids[j + 1], api_token)
+                                if success:
+                                    results["links_created"] += 1
 
-        # Show results summary
-        summary = f"Done! Created: {results['success']}, Failed: {results['failed']}"
-        if results["links_created"]:
-            summary += f", Links: {results['links_created']}"
-        st.success(summary)
-else:
-    missing = []
-    if not tasks:
-        missing.append("tasks")
-    if not api_token:
-        missing.append("API token")
-    if not list_id:
-        missing.append("List ID")
-    st.warning(f"Please provide: {', '.join(missing)}")
+                    status.text("Linking complete!")
+                except Exception as e:
+                    status.text(f"Error linking tasks: {e}")
+
+            # Show results summary
+            summary = f"Done! Created: {results['success']}, Failed: {results['failed']}"
+            if results["links_created"]:
+                summary += f", Links: {results['links_created']}"
+            st.success(summary)
+    else:
+        missing = []
+        if not api_token:
+            missing.append("API token")
+        if not list_id:
+            missing.append("List ID")
+        st.warning(f"Please provide: {', '.join(missing)}")
